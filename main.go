@@ -21,6 +21,7 @@ import (
 	"os"
 	"time"
 
+	intkube "github.com/fluxcd/helm-controller/internal/kube"
 	flag "github.com/spf13/pflag"
 	"helm.sh/helm/v3/pkg/kube"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -28,7 +29,6 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	ctrl "sigs.k8s.io/controller-runtime"
-	crtlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/fluxcd/pkg/runtime/acl"
 	"github.com/fluxcd/pkg/runtime/client"
@@ -36,7 +36,6 @@ import (
 	"github.com/fluxcd/pkg/runtime/events"
 	"github.com/fluxcd/pkg/runtime/leaderelection"
 	"github.com/fluxcd/pkg/runtime/logger"
-	"github.com/fluxcd/pkg/runtime/metrics"
 	"github.com/fluxcd/pkg/runtime/pprof"
 	"github.com/fluxcd/pkg/runtime/probes"
 	sourcev1 "github.com/fluxcd/source-controller/api/v1beta2"
@@ -76,7 +75,6 @@ func main() {
 		aclOptions            acl.Options
 		leaderElectionOptions leaderelection.Options
 		rateLimiterOptions    helper.RateLimiterOptions
-		defaultServiceAccount string
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-addr", ":8080", "The address the metric endpoint binds to.")
@@ -87,7 +85,7 @@ func main() {
 	flag.BoolVar(&watchAllNamespaces, "watch-all-namespaces", true,
 		"Watch for custom resources in all namespaces, if set to false it will only watch the runtime namespace.")
 	flag.IntVar(&httpRetry, "http-retry", 9, "The maximum number of retries when failing to fetch artifacts over HTTP.")
-	flag.StringVar(&defaultServiceAccount, "default-service-account", "", "Default service account used for impersonation.")
+	flag.StringVar(&intkube.DefaultServiceAccountName, "default-service-account", "", "Default service account used for impersonation.")
 	clientOptions.BindFlags(flag.CommandLine)
 	logOptions.BindFlags(flag.CommandLine)
 	aclOptions.BindFlags(flag.CommandLine)
@@ -97,9 +95,6 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(logger.NewLogger(logOptions))
-
-	metricsRecorder := metrics.NewRecorder()
-	crtlmetrics.Registry.MustRegister(metricsRecorder.Collectors()...)
 
 	watchNamespace := ""
 	if !watchAllNamespaces {
@@ -129,8 +124,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Register debugging related handlers first.
 	probes.SetupChecks(mgr, setupLog)
 	pprof.SetupHandlers(mgr, setupLog)
+
+	metricsH := helper.MustMakeMetrics(mgr)
 
 	var eventRecorder *events.Recorder
 	if eventRecorder, err = events.NewRecorder(mgr, ctrl.Log, eventsAddr, controllerName); err != nil {
@@ -138,15 +136,28 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err = (&controllers.HelmReleaseChartReconciler{
+		Client:              mgr.GetClient(),
+		EventRecorder:       eventRecorder,
+		Metrics:             metricsH,
+		NoCrossNamespaceRef: aclOptions.NoCrossNamespaceRefs,
+		ControllerName:      "helm-controller",
+	}).SetupWithManagerAndOptions(mgr, controllers.HelmReleaseChartReconcilerOptions{
+		MaxConcurrentReconciles: concurrent,
+		RateLimiter:             helper.GetRateLimiter(rateLimiterOptions),
+	}); err != nil {
+		setupLog.Error(err, "unable to create reconciler", "controller", v2.HelmReleaseKind, "reconciler", "chart")
+		os.Exit(1)
+	}
+
 	if err = (&controllers.HelmReleaseReconciler{
-		Client:                mgr.GetClient(),
-		Config:                mgr.GetConfig(),
-		Scheme:                mgr.GetScheme(),
-		EventRecorder:         eventRecorder,
-		MetricsRecorder:       metricsRecorder,
-		NoCrossNamespaceRef:   aclOptions.NoCrossNamespaceRefs,
-		DefaultServiceAccount: defaultServiceAccount,
-		KubeConfigOpts:        kubeConfigOpts,
+		Client:              mgr.GetClient(),
+		Config:              mgr.GetConfig(),
+		Scheme:              mgr.GetScheme(),
+		EventRecorder:       eventRecorder,
+		MetricsRecorder:     metricsH.MetricsRecorder,
+		NoCrossNamespaceRef: aclOptions.NoCrossNamespaceRefs,
+		KubeConfigOpts:      kubeConfigOpts,
 	}).SetupWithManager(mgr, controllers.HelmReleaseReconcilerOptions{
 		MaxConcurrentReconciles:   concurrent,
 		DependencyRequeueInterval: requeueDependency,
