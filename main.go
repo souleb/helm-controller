@@ -152,11 +152,11 @@ func main() {
 
 	if err = (&controllers.HelmReleaseReconciler{
 		Client:              mgr.GetClient(),
-		Config:              mgr.GetConfig(),
 		Scheme:              mgr.GetScheme(),
 		EventRecorder:       eventRecorder,
 		MetricsRecorder:     metricsH.MetricsRecorder,
 		NoCrossNamespaceRef: aclOptions.NoCrossNamespaceRefs,
+		ClientOpts:          clientOptions,
 		KubeConfigOpts:      kubeConfigOpts,
 	}).SetupWithManager(mgr, controllers.HelmReleaseReconcilerOptions{
 		MaxConcurrentReconciles:   concurrent,

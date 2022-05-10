@@ -81,6 +81,7 @@ type HelmReleaseReconciler struct {
 	EventRecorder       kuberecorder.EventRecorder
 	MetricsRecorder     *metrics.Recorder
 	NoCrossNamespaceRef bool
+	ClientOpts          fluxClient.Options
 	KubeConfigOpts      fluxClient.KubeConfigOptions
 }
 
@@ -471,7 +472,7 @@ func (r *HelmReleaseReconciler) checkDependencies(hr v2.HelmRelease) error {
 }
 
 func (r *HelmReleaseReconciler) buildRESTClientGetter(ctx context.Context, hr v2.HelmRelease) (genericclioptions.RESTClientGetter, error) {
-	var opts []kube.ClientGetterOption
+	opts := []kube.ClientGetterOption{kube.WithClientOptions(r.ClientOpts)}
 	if hr.Spec.ServiceAccountName != "" {
 		opts = append(opts, kube.WithImpersonate(hr.Spec.ServiceAccountName))
 	}
@@ -488,9 +489,9 @@ func (r *HelmReleaseReconciler) buildRESTClientGetter(ctx context.Context, hr v2
 		if err != nil {
 			return nil, err
 		}
-		opts = append(opts, kube.WithKubeConfig(kubeConfig, r.Config.QPS, r.Config.Burst, r.KubeConfigOpts))
+		opts = append(opts, kube.WithKubeConfig(kubeConfig, r.KubeConfigOpts))
 	}
-	return kube.BuildClientGetter(r.Config, hr.GetReleaseNamespace(), opts...), nil
+	return kube.BuildClientGetter(hr.GetReleaseNamespace(), opts...)
 }
 
 // getHelmChart retrieves the v1beta2.HelmChart for the given
