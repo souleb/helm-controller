@@ -491,7 +491,6 @@ func (r *HelmReleaseReconciler) buildRESTClientGetter(ctx context.Context, hr v2
 		opts = append(opts, kube.WithKubeConfig(kubeConfig, r.Config.QPS, r.Config.Burst, r.KubeConfigOpts))
 	}
 	return kube.BuildClientGetter(r.Config, hr.GetReleaseNamespace(), opts...), nil
-
 }
 
 // getHelmChart retrieves the v1beta2.HelmChart for the given
