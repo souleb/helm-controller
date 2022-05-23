@@ -40,7 +40,7 @@ contexts:
     cluster: cow-cluster
     user: blue-user
   name: federal-context
-kind: Config
+kind: config
 users:
 - name: blue-user
   user:

@@ -22,7 +22,6 @@ import (
 	"time"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -89,7 +88,7 @@ type HelmReleaseSpec struct {
 	Suspend bool `json:"suspend,omitempty"`
 
 	// ReleaseName used for the Helm release. Defaults to a composition of
-	// '[TargetNamespace-]Name'.
+	// '[TargetNamespace-]Type'.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=53
 	// +kubebuilder:validation:Optional
@@ -781,6 +780,40 @@ func (in Uninstall) GetTimeout(defaultTimeout metav1.Duration) metav1.Duration {
 	return *in.Timeout
 }
 
+type HelmReleaseInfo struct {
+	// Digest is the checksum of the release object in storage.
+	// It has the format of `<algo>:<checksum>`.
+	Digest string `json:"digest,omitempty"`
+	// Name is the name of the release.
+	Name string `json:"name"`
+	// Version is the version of the release object in storage.
+	Version int `json:"version,omitempty"`
+	// ChartName is the chart name of the release object in storage.
+	ChartName string `json:"chartName,omitempty"`
+	// ChartVersion is the chart version of the release object in
+	// storage.
+	ChartVersion string `json:"chartVersion,omitempty"`
+	// ConfigDigest is the checksum of the config (better known as
+	// "values") of the release object in storage.
+	// It has the format of `<algo>:<checksum>`.
+	ConfigDigest string `json:"valuesDigest,omitempty"`
+	// FirstDeployed is when the release was first deployed.
+	FirstDeployed time.Time `json:"first_deployed,omitempty"`
+	// LastDeployed is when the release was last deployed.
+	LastDeployed time.Time `json:"last_deployed,omitempty"`
+	// Deleted is when the release was deleted.
+	Deleted time.Time `json:"deleted,omitempty"`
+	// Status is the current state of the release
+	Status string `json:"status,omitempty"`
+}
+
+type HelmReleaseTest struct {
+	Suite         string
+	LastStarted   time.Time
+	LastCompleted time.Time
+	Phase         string
+}
+
 // HelmReleaseStatus defines the observed state of a HelmRelease.
 type HelmReleaseStatus struct {
 	// ObservedGeneration is the last observed generation.
@@ -793,11 +826,16 @@ type HelmReleaseStatus struct {
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
-	// LastAppliedRevision is the revision of the last successfully applied source.
-	// +optional
-	LastAppliedRevision string `json:"lastAppliedRevision,omitempty"`
+	// Current holds the latest observed HelmReleaseInfo for the current
+	// release.
+	Current *HelmReleaseInfo `json:"current,omitempty"`
 
-	// LastAttemptedRevision is the revision of the last reconciliation attempt.
+	// Previous holds the latest observed HelmReleaseInfo for the previous
+	// release.
+	Previous *HelmReleaseInfo `json:"previous,omitempty"`
+
+	// LastAttemptedRevision is the Source revision of the last reconciliation
+	// attempt.
 	// +optional
 	LastAttemptedRevision string `json:"lastAttemptedRevision,omitempty"`
 
@@ -805,10 +843,6 @@ type HelmReleaseStatus struct {
 	// reconciliation attempt.
 	// +optional
 	LastAttemptedValuesChecksum string `json:"lastAttemptedValuesChecksum,omitempty"`
-
-	// LastReleaseRevision is the revision of the last successful Helm release.
-	// +optional
-	LastReleaseRevision int `json:"lastReleaseRevision,omitempty"`
 
 	// HelmChart is the namespaced name of the HelmChart resource created by
 	// the controller for the HelmRelease.
@@ -840,68 +874,6 @@ func (in HelmReleaseStatus) GetHelmChart() (string, string) {
 		return split[0], split[1]
 	}
 	return "", ""
-}
-
-// HelmReleaseProgressing resets any failures and registers progress toward
-// reconciling the given HelmRelease by setting the meta.ReadyCondition to
-// 'Unknown' for meta.ProgressingReason.
-func HelmReleaseProgressing(hr HelmRelease) HelmRelease {
-	hr.Status.Conditions = []metav1.Condition{}
-	newCondition := metav1.Condition{
-		Type:    meta.ReadyCondition,
-		Status:  metav1.ConditionUnknown,
-		Reason:  meta.ProgressingReason,
-		Message: "Reconciliation in progress",
-	}
-	apimeta.SetStatusCondition(hr.GetStatusConditions(), newCondition)
-	resetFailureCounts(&hr)
-	return hr
-}
-
-// HelmReleaseNotReady registers a failed reconciliation of the given HelmRelease.
-func HelmReleaseNotReady(hr HelmRelease, reason, message string) HelmRelease {
-	newCondition := metav1.Condition{
-		Type:    meta.ReadyCondition,
-		Status:  metav1.ConditionFalse,
-		Reason:  reason,
-		Message: message,
-	}
-	apimeta.SetStatusCondition(hr.GetStatusConditions(), newCondition)
-	hr.Status.Failures++
-	return hr
-}
-
-// HelmReleaseReady registers a successful reconciliation of the given HelmRelease.
-func HelmReleaseReady(hr HelmRelease) HelmRelease {
-	newCondition := metav1.Condition{
-		Type:    meta.ReadyCondition,
-		Status:  metav1.ConditionTrue,
-		Reason:  ReconciliationSucceededReason,
-		Message: "Release reconciliation succeeded",
-	}
-	apimeta.SetStatusCondition(hr.GetStatusConditions(), newCondition)
-	hr.Status.LastAppliedRevision = hr.Status.LastAttemptedRevision
-	resetFailureCounts(&hr)
-	return hr
-}
-
-// HelmReleaseAttempted registers an attempt of the given HelmRelease with the given state.
-// and returns the modified HelmRelease and a boolean indicating a state change.
-func HelmReleaseAttempted(hr HelmRelease, revision string, releaseRevision int, valuesChecksum string) (HelmRelease, bool) {
-	changed := hr.Status.LastAttemptedRevision != revision ||
-		hr.Status.LastReleaseRevision != releaseRevision ||
-		hr.Status.LastAttemptedValuesChecksum != valuesChecksum
-	hr.Status.LastAttemptedRevision = revision
-	hr.Status.LastReleaseRevision = releaseRevision
-	hr.Status.LastAttemptedValuesChecksum = valuesChecksum
-
-	return hr, changed
-}
-
-func resetFailureCounts(hr *HelmRelease) {
-	hr.Status.Failures = 0
-	hr.Status.InstallFailures = 0
-	hr.Status.UpgradeFailures = 0
 }
 
 const (
@@ -946,7 +918,7 @@ func (in HelmRelease) GetValues() map[string]interface{} {
 }
 
 // GetReleaseName returns the configured release name, or a composition of
-// '[TargetNamespace-]Name'.
+// '[TargetNamespace-]Type'.
 func (in HelmRelease) GetReleaseName() string {
 	if in.Spec.ReleaseName != "" {
 		return in.Spec.ReleaseName

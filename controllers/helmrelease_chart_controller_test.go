@@ -771,7 +771,7 @@ func Test_helmChartDiff(t *testing.T) {
 					Name: "bucket",
 				},
 			},
-			diff: "SourceRef.Kind:\n-GitRepository\n+Bucket\n\nSourceRef.Name:\n-gitrepository\n+bucket",
+			diff: "SourceRef.Kind:\n-GitRepository\n+Bucket\n\nSourceRef.Type:\n-gitrepository\n+bucket",
 			eq:   false,
 		},
 		{
@@ -786,7 +786,7 @@ func Test_helmChartDiff(t *testing.T) {
 			new: sourcev1.HelmChartSpec{
 				Chart: "./path.tgz",
 			},
-			diff: "SourceRef.Kind:\n-GitRepository\n\nSourceRef.Name:\n-gitrepository",
+			diff: "SourceRef.Kind:\n-GitRepository\n\nSourceRef.Type:\n-gitrepository",
 			eq:   false,
 		},
 		{

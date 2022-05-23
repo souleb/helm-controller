@@ -17,13 +17,14 @@ limitations under the License.
 package storage
 
 import (
-	"crypto/sha256"
 	"fmt"
 	"log"
 	"os"
 	"testing"
 
 	. "github.com/onsi/gomega"
+	"github.com/opencontainers/go-digest"
+	_ "github.com/opencontainers/go-digest/blake3"
 	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/storage/driver"
@@ -89,7 +90,6 @@ Namespace: void
 data:
   sky: blue
 `,
-			ManifestSHA256: "1e472606d9e10ab58c5264a6b45aa2d5dad96d06f27423140fd6280a48a0b775",
 			Hooks: []release.Hook{
 				{
 					Name:   "passing-test",
@@ -139,7 +139,6 @@ func TestNewObservedRelease(t *testing.T) {
 				w.Expect(obsRel.ChartMetadata).To(Equal(*rel.Chart.Metadata))
 				w.Expect(obsRel.Config).To(Equal(rel.Config))
 				w.Expect(obsRel.Manifest).To(Equal(rel.Manifest))
-				w.Expect(obsRel.ManifestSHA256).To(Equal(fmt.Sprintf("%x", sha256.Sum256([]byte(rel.Manifest)))))
 				w.Expect(obsRel.Hooks).To(HaveLen(len(rel.Hooks)))
 				for k, v := range rel.Hooks {
 					w.Expect(obsRel.Hooks[k]).To(Equal(*v))
@@ -532,4 +531,38 @@ func BenchmarkNewObservedReleaseMid(b *testing.B) {
 
 func BenchmarkNewObservedReleaseBigger(b *testing.B) {
 	benchmarkNewObservedRelease(*biggerRelease, b)
+}
+
+var digestAlgos = []digest.Algorithm{
+	digest.SHA256,
+	digest.SHA384,
+	digest.SHA512,
+	digest.BLAKE3,
+}
+
+func benchmarkDigest(rel ObservedRelease, b *testing.B) {
+	for _, a := range digestAlgos {
+		b.Run(a.String(), func(b *testing.B) {
+			b.ReportAllocs()
+			for n := 0; n < b.N; n++ {
+				Digest(a, &rel)
+			}
+		})
+	}
+
+}
+
+func BenchmarkDigestReleaseSmall(b *testing.B) {
+	obs := NewObservedRelease(smallRelease)
+	benchmarkDigest(obs, b)
+}
+
+func BenchmarkDigestReleaseMid(b *testing.B) {
+	obs := NewObservedRelease(midRelease)
+	benchmarkDigest(obs, b)
+}
+
+func BenchmarkDigestReleaseBigger(b *testing.B) {
+	obs := NewObservedRelease(biggerRelease)
+	benchmarkDigest(obs, b)
 }

@@ -17,9 +17,10 @@ limitations under the License.
 package kube
 
 import (
+	"testing"
+
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"testing"
 
 	"github.com/fluxcd/pkg/runtime/client"
 	. "github.com/onsi/gomega"
@@ -60,7 +61,7 @@ contexts:
 - context:
     cluster: example-cluster
     namespace: flux-system
-kind: Config
+kind: config
 preferences: {}
 users:`)
 		clientOpts := client.Options{QPS: 600, Burst: 1000}

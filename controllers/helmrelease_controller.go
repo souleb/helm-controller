@@ -18,9 +18,15 @@ package controllers
 
 import (
 	"context"
+	"crypto/sha1"
 	"errors"
 	"fmt"
 	"time"
+
+	action2 "github.com/fluxcd/helm-controller/internal/action"
+	"github.com/fluxcd/helm-controller/internal/storage"
+	"github.com/fluxcd/pkg/runtime/logger"
+	"helm.sh/helm/v3/pkg/release"
 
 	"github.com/hashicorp/go-retryablehttp"
 	"helm.sh/helm/v3/pkg/chart"
@@ -108,7 +114,7 @@ func (r *HelmReleaseReconciler) SetupWithManager(mgr ctrl.Manager, opts HelmRele
 	r.requeueDependency = opts.DependencyRequeueInterval
 
 	// Configure the retryable http client used for fetching artifacts.
-	// By default it retries 10 times within a 3.5 minutes window.
+	// By default, it retries 10 times within a 3.5 minutes window.
 	httpClient := retryablehttp.NewClient()
 	httpClient.RetryWaitMin = 5 * time.Second
 	httpClient.RetryWaitMax = 30 * time.Second
@@ -289,160 +295,272 @@ func (r *HelmReleaseReconciler) reconcile(ctx context.Context, hr v2.HelmRelease
 	return reconciledHr, ctrl.Result{RequeueAfter: hr.Spec.Interval.Duration}, reconcileErr
 }
 
-func (r *HelmReleaseReconciler) reconcileRelease(ctx context.Context,
-	hr v2.HelmRelease, chart *chart.Chart, values chartutil.Values) (v2.HelmRelease, error) {
-	log := ctrl.LoggerFrom(ctx)
+func (r *HelmReleaseReconciler) reconcileReleases(ctx context.Context, config *action2.Configuration, obj *v2.HelmRelease,
+	chrt *chart.Chart, vals chartutil.Values) (ctrl.Result, error) {
 
-	// Initialize Helm action runner
-	getter, err := r.buildRESTClientGetter(ctx, hr)
+	obs, err := action2.Verify(config, obj, chrt.Metadata, vals)
+	switch err {
+	case action2.ErrVerifyReleaseMissing, action2.ErrVerifyCurrentDisappeared:
+		return r.reconcileInstall(ctx, config, obj, chrt, vals)
+	case action2.ErrVerifyDigest, action2.ErrVerifyCurrentMissing, action2.ErrVerifyChartChanged:
+		return r.reconcileUpgrade(ctx, config, obj, chrt, vals)
+	case nil:
+		return ctrl.Result{},
+	}
 	if err != nil {
-		return v2.HelmReleaseNotReady(hr, v2.InitFailedReason, err.Error()), err
+		switch expr {
+
+		}
+	} 
+}
+
+func (r *HelmReleaseReconciler) reconcileInstall(ctx context.Context, config *action2.Configuration, obj *v2.HelmRelease,
+	chrt *chart.Chart, vals chartutil.Values) (ctrl.Result, error) {
+	// Run the installation action.
+	_, actionErr := action2.Install(ctx, config, obj, chrt, vals)
+
+	//
+	// Confirm observation was made if installation is successful.
+	obs, err = config.Observer().LastObservation(obj.GetReleaseName())
+	if actionErr == nil {
+		if err != nil {
+			// Do not count this as an installation error, as it is not expected to
+			// be the cause of user input.
+			if err == storage.ErrReleaseNotObserved {
+				err = fmt.Errorf("%w: expected observation of install", err)
+			}
+			return ctrl.Result{}, err
+		}
+		if obs.HasStatus(release.StatusDeployed) {
+			// Mark the applied revision as observed from the release
+			// and reset any failure counts.
+			obj.Status.LastAppliedRevision = obs.ChartMetadata.Version
+			obj.Status.InstallFailures = 0
+		}
 	}
-	run, err := runner.NewRunner(getter, hr.GetStorageNamespace(), log)
+
+	// Mark any install failure.
+	if actionErr != nil || !obs.HasStatus(release.StatusDeployed) {
+		ctrl.LoggerFrom(ctx).V(logger.DebugLevel).Info(fmt.Sprintf("install error:"+
+			"release %s has status %s", obs.Name, obs.Info.Status.String()))
+		obj.Status.InstallFailures++
+	}
+
+	// Make note of checksum.
+	obj.Status.LastObservedReleaseChecksum = obs.Digest().String()
+
+	// Return an empty result (as we are not expecting to install again),
+	// or an error.
+	return ctrl.Result{}, actionErr
+}
+
+func (r *HelmReleaseReconciler) reconcileUpgrade(ctx context.Context, config *action2.Configuration, obj *v2.HelmRelease,
+	chrt *chart.Chart, vals chartutil.Values) (ctrl.Result, error) {
+
+	// Make a new observation of the current state.
+	prevRel, err := config.Observer().ObserveLastRelease(obj.GetReleaseName())
 	if err != nil {
-		return v2.HelmReleaseNotReady(hr, v2.InitFailedReason, "failed to initialize Helm action runner"), err
+		if err == driver.ErrReleaseNotFound {
+			return ctrl.Result{Requeue: true}, nil
+		}
+		return ctrl.Result{}, err
 	}
 
-	// Determine last release revision.
-	rel, observeLastReleaseErr := run.ObserveLastRelease(hr)
-	if observeLastReleaseErr != nil {
-		err = fmt.Errorf("failed to get last release revision: %w", observeLastReleaseErr)
-		return v2.HelmReleaseNotReady(hr, v2.GetLastReleaseFailedReason, "failed to get last release revision"), err
+	checksumMatch := prevRel.Checksum() == obj.Status.LastObservedReleaseChecksum
+	valuesMatch := util.ValuesChecksum(sha1.New(), prevRel.Config) == util.ValuesChecksum(sha1.New(), vals)
+	chartMatch := prevRel.ChartMetadata.Version == obj.Status.LastAttemptedRevision
+	if checksumMatch && valuesMatch && chartMatch {
+		ctrl.LoggerFrom(ctx).V(logger.DebugLevel).Info(fmt.Sprintf("upgrade error:"+
+			"release %s has status %s", prevRel.Name, prevRel.Info.Status.String()))
+		return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, nil
 	}
 
-	// Register the current release attempt.
-	revision := chart.Metadata.Version
-	releaseRevision := util.ReleaseRevision(rel)
-	valuesChecksum := util.ValuesChecksum(values)
-	hr, hasNewState := v2.HelmReleaseAttempted(hr, revision, releaseRevision, valuesChecksum)
-	if hasNewState {
-		hr = v2.HelmReleaseProgressing(hr)
-		if updateStatusErr := r.patchStatus(ctx, &hr); updateStatusErr != nil {
-			log.Error(updateStatusErr, "unable to update status after state update")
-			return hr, updateStatusErr
-		}
-		// Record progressing status
-		r.recordReadiness(ctx, hr)
-	}
-
-	// Check status of any previous release attempt.
-	released := apimeta.FindStatusCondition(hr.Status.Conditions, v2.ReleasedCondition)
-	if released != nil {
-		switch released.Status {
-		// Succeed if the previous release attempt succeeded.
-		case metav1.ConditionTrue:
-			return v2.HelmReleaseReady(hr), nil
-		case metav1.ConditionFalse:
-			// Fail if the previous release attempt remediation failed.
-			remediated := apimeta.FindStatusCondition(hr.Status.Conditions, v2.RemediatedCondition)
-			if remediated != nil && remediated.Status == metav1.ConditionFalse {
-				err = fmt.Errorf("previous release attempt remediation failed")
-				return v2.HelmReleaseNotReady(hr, remediated.Reason, remediated.Message), err
-			}
-		}
-
-		// Fail if install retries are exhausted.
-		if hr.Spec.GetInstall().GetRemediation().RetriesExhausted(hr) {
-			err = fmt.Errorf("install retries exhausted")
-			return v2.HelmReleaseNotReady(hr, released.Reason, err.Error()), err
-		}
-
-		// Fail if there is a release and upgrade retries are exhausted.
-		// This avoids failing after an upgrade uninstall remediation strategy.
-		if rel != nil && hr.Spec.GetUpgrade().GetRemediation().RetriesExhausted(hr) {
-			err = fmt.Errorf("upgrade retries exhausted")
-			return v2.HelmReleaseNotReady(hr, released.Reason, err.Error()), err
+	_, actionErr := action2.Upgrade(ctx, config, obj, chrt, vals)
+	// Confirm observation was made if upgrade is successful.
+	rel, err := config.Observer().LastObservation(obj.GetReleaseName())
+	if actionErr != nil {
+		if err == storage.ErrReleaseNotObserved {
+			// Do not count this as an upgrade error, as it is not expected to
+			// be the cause of user input.
+			return ctrl.Result{}, fmt.Errorf("%w: expected observation of upgrade", err)
 		}
 	}
 
-	// Deploy the release.
-	var deployAction v2.DeploymentAction
-	if rel == nil {
-		r.event(ctx, hr, revision, events.EventSeverityInfo, "Helm install has started")
-		deployAction = hr.Spec.GetInstall()
-		rel, err = run.Install(hr, chart, values)
-		err = r.handleHelmActionResult(ctx, &hr, revision, err, deployAction.GetDescription(),
-			v2.ReleasedCondition, v2.InstallSucceededReason, v2.InstallFailedReason)
-	} else {
-		r.event(ctx, hr, revision, events.EventSeverityInfo, "Helm upgrade has started")
-		deployAction = hr.Spec.GetUpgrade()
-		rel, err = run.Upgrade(hr, chart, values)
-		err = r.handleHelmActionResult(ctx, &hr, revision, err, deployAction.GetDescription(),
-			v2.ReleasedCondition, v2.UpgradeSucceededReason, v2.UpgradeFailedReason)
-	}
-	remediation := deployAction.GetRemediation()
+	// Take note of checksum object. When obs is empty, this simply resets
+	// to an empty string.
+	obj.Status.LastObservedReleaseChecksum = rel.Checksum()
+	obj.Status.LastAttemptedRevision = rel.ChartMetadata.Version
+	obj.Status.LastAttemptedValuesChecksum = util.ValuesChecksum(sha1.New(), rel.Config)
 
-	// If there is a new release revision...
-	if util.ReleaseRevision(rel) > releaseRevision {
-		// Ensure release is not marked remediated.
-		apimeta.RemoveStatusCondition(&hr.Status.Conditions, v2.RemediatedCondition)
-
-		// If new release revision is successful and tests are enabled, run them.
-		if err == nil && hr.Spec.GetTest().Enable {
-			_, testErr := run.Test(hr)
-			testErr = r.handleHelmActionResult(ctx, &hr, revision, testErr, "test",
-				v2.TestSuccessCondition, v2.TestSucceededReason, v2.TestFailedReason)
-
-			// Propagate any test error if not marked ignored.
-			if testErr != nil && !remediation.MustIgnoreTestFailures(hr.Spec.GetTest().IgnoreFailures) {
-				testsPassing := apimeta.FindStatusCondition(hr.Status.Conditions, v2.TestSuccessCondition)
-				newCondition := metav1.Condition{
-					Type:    v2.ReleasedCondition,
-					Status:  metav1.ConditionFalse,
-					Reason:  testsPassing.Reason,
-					Message: testsPassing.Message,
-				}
-				apimeta.SetStatusCondition(hr.GetStatusConditions(), newCondition)
-				err = testErr
-			}
-		}
+	// Log status for now.
+	// TODO(hidde): probably reflect more in either Status, Events or both.
+	if prevRel.Info.Status != release.StatusDeployed {
+		ctrl.LoggerFrom(ctx).V(logger.DebugLevel).Info(fmt.Sprintf("install error:"+
+			"release %s has status %s", prevRel.Name, prevRel.Info.Status.String()))
 	}
 
+	// Return an empty result (as we are not expecting to install again),
+	// or an error.
+	return ctrl.Result{}, actionErr
+}
+
+func (r *HelmReleaseReconciler) reconcileTest(ctx context.Context, config *action2.Configuration, obj *v2.HelmRelease) (ctrl.Result, error) {
+	if !obj.Spec.GetTest().Enable {
+		// Skip any testing as it is not enabled.
+		return ctrl.Result{}, nil
+	}
+
+	// Confirm we do have a release in storage.
+	obs, err := config.Observer().ObserveLastRelease(obj.GetReleaseName())
 	if err != nil {
-		// Increment failure count for deployment action.
-		remediation.IncrementFailureCount(&hr)
-		// Remediate deployment failure if necessary.
-		if !remediation.RetriesExhausted(hr) || remediation.MustRemediateLastFailure() {
-			if util.ReleaseRevision(rel) <= releaseRevision {
-				log.Info(fmt.Sprintf("skipping remediation, no new release revision created"))
-			} else {
-				var remediationErr error
-				switch remediation.GetStrategy() {
-				case v2.RollbackRemediationStrategy:
-					rollbackErr := run.Rollback(hr)
-					remediationErr = r.handleHelmActionResult(ctx, &hr, revision, rollbackErr, "rollback",
-						v2.RemediatedCondition, v2.RollbackSucceededReason, v2.RollbackFailedReason)
-				case v2.UninstallRemediationStrategy:
-					uninstallErr := run.Uninstall(hr)
-					remediationErr = r.handleHelmActionResult(ctx, &hr, revision, uninstallErr, "uninstall",
-						v2.RemediatedCondition, v2.UninstallSucceededReason, v2.UninstallFailedReason)
-				}
-				if remediationErr != nil {
-					err = remediationErr
-				}
-			}
-
-			// Determine release after remediation.
-			rel, observeLastReleaseErr = run.ObserveLastRelease(hr)
-			if observeLastReleaseErr != nil {
-				err = &ConditionError{
-					Reason: v2.GetLastReleaseFailedReason,
-					Err:    errors.New("failed to get last release revision after remediation"),
-				}
-			}
+		if err == driver.ErrReleaseNotFound {
+			return ctrl.Result{Requeue: true}, nil
 		}
+		return ctrl.Result{}, err
+	}
+	if obs.Checksum() != obj.Status.LastObservedReleaseChecksum {
+		// Checksum mismatch, assume we first need to settle this and return.
+		return ctrl.Result{}, nil
+	}
+	if !obs.HasStatus(release.StatusDeployed) || obs.HasBeenTested() {
+		// Release is in a failed state or has already been tested.
+		// We should either wait for a new release, or a rollback.
+		return ctrl.Result{}, nil
 	}
 
-	hr.Status.LastReleaseRevision = util.ReleaseRevision(rel)
-
+	// Run tests for the release and observe the result
+	_, actionErr := action2.Test(ctx, config, obj)
+	lastObs, err := config.Observer().LastObservation(obj.GetReleaseName())
 	if err != nil {
-		reason := v2.ReconciliationFailedReason
-		if condErr := (*ConditionError)(nil); errors.As(err, &condErr) {
-			reason = condErr.Reason
-		}
-		return v2.HelmReleaseNotReady(hr, reason, err.Error()), err
+		return ctrl.Result{}, fmt.Errorf("failed to observe release after running test: %w", err)
 	}
-	return v2.HelmReleaseReady(hr), nil
+
+	// As Helm just targets the latest release version, we have to confirm
+	// we actually tested the earlier observed version. If this mismatches,
+	// something modified the storage between our last observation and the
+	// test trigger.
+	if obs.Version != lastObs.Version {
+		return ctrl.Result{}, fmt.Errorf("observed test release version %d did not match expected %d",
+			lastObs.Version, obs.Version)
+	}
+
+	if lastObs.Checksum() == "" {
+		return ctrl.Result{}, fmt.Errorf("expected observed release test to have checksum")
+	}
+	obj.Status.LastObservedReleaseChecksum = lastObs.Checksum()
+
+	// Confirm release has been tested, this does not confirm test results.
+	if !lastObs.HasBeenTested() {
+		if actionErr != nil {
+			return ctrl.Result{}, actionErr
+		}
+		return ctrl.Result{}, fmt.Errorf("expected release to be tested")
+	}
+
+	if lastObs.HasFailedTests() {
+		// Tests failed.
+		return ctrl.Result{}, fmt.Errorf("failed tests")
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *HelmReleaseReconciler) reconcileRollback(ctx context.Context, config *action2.Configuration, obj *v2.HelmRelease) (ctrl.Result, error) {
+	// Confirm we do have a release in storage.
+	obs, err := config.Observer().ObserveLastRelease(obj.GetReleaseName())
+	if err != nil {
+		if err == driver.ErrReleaseNotFound {
+			return ctrl.Result{}, nil
+		}
+
+		return ctrl.Result{}, err
+	}
+
+	if checksum := obs.Checksum(); checksum == "" || checksum != obj.Status.LastObservedReleaseChecksum {
+		return ctrl.Result{}, nil
+	}
+
+	if obs.HasStatus(release.StatusDeployed) && !obs.HasFailedTests() {
+		return ctrl.Result{}, nil
+	}
+
+	if obj.Status.LastReleaseRevision < 1 || obs.Version <= 1 {
+		// We are unable to perform any rollback if we do not have a last
+		// successful revision, or if there aren't more than two revisions.
+		return ctrl.Result{}, nil
+	}
+	if obj.Status.LastReleaseRevision >= obs.Version {
+		return ctrl.Result{}, fmt.Errorf("can not rollback to release version higher than or equal to current")
+	}
+
+	strategy := obj.Spec.GetUpgrade().GetRemediation()
+	if strategy.GetStrategy() != v2.RollbackRemediationStrategy {
+		return ctrl.Result{}, nil
+	}
+	if strategy.RetriesExhausted(*obj) || !strategy.MustRemediateLastFailure() {
+		return ctrl.Result{}, nil
+	}
+
+	prevObs, err := config.Observer().GetObservedVersion(obj.GetReleaseName(), obj.Status.LastReleaseRevision)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to observe previous successful release with version %d: %w",
+			obj.Status.LastReleaseRevision, err)
+	}
+	if obj.Status.LastReleaseChecksum != "" && prevObs.Checksum() != obj.Status.LastReleaseChecksum {
+		return ctrl.Result{}, fmt.Errorf("cannot rollback to release with version %d: checksum mismatch (%s => %s)",
+			prevObs.Version, obj.Status.LastReleaseChecksum, prevObs.Checksum())
+	}
+
+	actionErr := action2.Rollback(ctx, config, obj, obj.Status.LastReleaseRevision)
+	lastObs, err := config.Observer().LastObservation(obj.GetReleaseName())
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to observe release after rollback: %w", err)
+	}
+	// TODO: check if failed
+	// TODO: record checksum if succeeded
+	if actionErr == nil {
+
+	}
+	if lastObs.
+	if lastObs.
+}
+
+func (r *HelmReleaseReconciler) reconcileUninstall(ctx context.Context, config *action2.Configuration, obj *v2.HelmRelease) (ctrl.Result, error) {
+	// Confirm we do have a release in storage.
+	obs, err := config.Observer().ObserveLastRelease(obj.GetReleaseName())
+	if err != nil {
+		if err == driver.ErrReleaseNotFound {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
+
+	if checksum := obs.Checksum(); checksum == "" || checksum != obj.Status.LastObservedReleaseChecksum {
+		return ctrl.Result{}, nil
+	}
+
+	if obj.DeletionTimestamp == nil {
+		if obs.HasStatus(release.StatusDeployed) && !obs.HasFailedTests() {
+			return ctrl.Result{}, nil
+		}
+
+		var strategy v2.Remediation = obj.Spec.Install.Remediation
+		if obs.Version > 1 && obj.Status.LastAppliedRevision != "" {
+			strategy = obj.Spec.Upgrade.Remediation
+		}
+		if strategy.GetStrategy() != v2.UninstallRemediationStrategy {
+			return ctrl.Result{}, nil
+		}
+		if strategy.RetriesExhausted(*obj) || !strategy.MustRemediateLastFailure() {
+			return ctrl.Result{}, nil
+		}
+	}
+
+	_, actionErr := action2.Uninstall(ctx, config, obj)
+	lastObs, err := config.Observer().LastObservation(obj.GetReleaseName())
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 }
 
 func (r *HelmReleaseReconciler) checkDependencies(hr v2.HelmRelease) error {
@@ -545,37 +663,6 @@ func (r *HelmReleaseReconciler) reconcileDelete(ctx context.Context, hr v2.HelmR
 	}
 
 	return ctrl.Result{}, nil
-}
-
-func (r *HelmReleaseReconciler) handleHelmActionResult(ctx context.Context,
-	hr *v2.HelmRelease, revision string, err error, action string, condition string, succeededReason string, failedReason string) error {
-	if err != nil {
-		err = fmt.Errorf("Helm %s failed: %w", action, err)
-		msg := err.Error()
-		if actionErr := (*runner.ActionError)(nil); errors.As(err, &actionErr) {
-			msg = msg + "\n\nLast Helm logs:\n\n" + actionErr.CapturedLogs
-		}
-		newCondition := metav1.Condition{
-			Type:    condition,
-			Status:  metav1.ConditionFalse,
-			Reason:  failedReason,
-			Message: msg,
-		}
-		apimeta.SetStatusCondition(hr.GetStatusConditions(), newCondition)
-		r.event(ctx, *hr, revision, events.EventSeverityError, msg)
-		return &ConditionError{Reason: failedReason, Err: err}
-	} else {
-		msg := fmt.Sprintf("Helm %s succeeded", action)
-		newCondition := metav1.Condition{
-			Type:    condition,
-			Status:  metav1.ConditionTrue,
-			Reason:  succeededReason,
-			Message: msg,
-		}
-		apimeta.SetStatusCondition(hr.GetStatusConditions(), newCondition)
-		r.event(ctx, *hr, revision, events.EventSeverityInfo, msg)
-		return nil
-	}
 }
 
 func (r *HelmReleaseReconciler) patchStatus(ctx context.Context, hr *v2.HelmRelease) error {
